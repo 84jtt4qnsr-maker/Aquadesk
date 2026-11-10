@@ -6445,7 +6445,7 @@ func renderSnapshot(to path: String, sampleClaude: String?) {
 enum AppInfo {
     /// From Info.plist, which build.sh writes; the fallback covers runs outside the app bundle.
     static var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1"
     }
 }
 
