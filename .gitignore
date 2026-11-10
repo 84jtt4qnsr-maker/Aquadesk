@@ -1,0 +1,5 @@
+Aquadesk.app/
+.DS_Store
+.claude/
+# The promo video is shared as a release attachment, not kept in history.
+demo/demo.mp4
