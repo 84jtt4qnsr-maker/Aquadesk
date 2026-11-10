@@ -2179,6 +2179,8 @@ final class WidgetModel: ObservableObject {
     var aquariumClock: Date?
     @Published var layout = WidgetLayout.load()
     @Published var isEditingLayout = false
+    /// The widget's measured content height; kept here rather than in the view's @State (see ShortcutSlot).
+    @Published var contentHeight: CGFloat = 0
     let panelDrag = PanelDragState()
     private var resizeStart: WidgetLayout?
 
@@ -3713,12 +3715,14 @@ enum MonochromeIcon {
 struct ShortcutSlot: View {
     let shortcut: Shortcut?
     let onDrop: (URL) -> Void
-    @State private var isTargeted = false
+    /// Kept by the caller rather than in @State: the State macro's plugin ships with Xcode but not
+    /// with every Command Line Tools release, and the app must build with either.
+    var isTargeted: Binding<Bool> = .constant(false)
 
     var body: some View {
         ZStack(alignment: .bottom) {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(isTargeted ? 0.20 : (shortcut == nil ? 0.04 : 0.08)))
+                .fill(Color.white.opacity(isTargeted.wrappedValue ? 0.20 : (shortcut == nil ? 0.04 : 0.08)))
             if let shortcut {
                 if shortcut.kind == .file, let url = shortcut.url {
                     // App icons carry a transparent margin, so a slight overscale makes them fill the tile.
@@ -3750,7 +3754,7 @@ struct ShortcutSlot: View {
         }
         .aspectRatio(1, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .onDrop(of: [UTType.fileURL], isTargeted: $isTargeted) { providers in
+        .onDrop(of: [UTType.fileURL], isTargeted: isTargeted) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
@@ -4095,6 +4099,8 @@ final class SlotDragState: ObservableObject {
     @Published var source: Int?
     @Published var location = CGPoint.zero
     @Published var target: Int?
+    /// The slot a file from Finder is being held over.
+    @Published var fileTarget: Int?
 }
 
 struct ShortcutGrid: View {
@@ -4108,7 +4114,11 @@ struct ShortcutGrid: View {
             ForEach(0..<ShortcutStore.slotCount, id: \.self) { index in
                 let isSource = drag.source == index
                 let isTarget = drag.source != nil && drag.target == index && !isSource
-                ShortcutSlot(shortcut: store.slots[index]) { store.drop($0, on: index) }
+                ShortcutSlot(shortcut: store.slots[index], onDrop: { store.drop($0, on: index) }, isTargeted: Binding(
+                    get: { drag.fileTarget == index },
+                    set: { targeted in
+                        if targeted { drag.fileTarget = index } else if drag.fileTarget == index { drag.fileTarget = nil }
+                    }))
                     .opacity(isSource ? 0.3 : 1)
                     .overlay {
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -4805,7 +4815,6 @@ struct WidgetView: View {
     var solidBackground = false
     var onTargetFrame: @MainActor (ClickTarget, CGRect) -> Void = { _, _ in }
     var onHeight: @MainActor (CGFloat) -> Void = { _ in }
-    @State private var contentHeight: CGFloat = 0
 
     private func reportFrame(of target: ClickTarget) -> some View {
         FrameReporter(onRemove: { onTargetFrame(target, .null) }) { onTargetFrame(target, $0) }
@@ -4814,10 +4823,10 @@ struct WidgetView: View {
     /// A fixed height when one is set, otherwise the content's; never past the screen's bottom.
     /// Whatever doesn't fit scrolls. The wide layout always takes its content's height.
     private var displayedHeight: CGFloat? {
-        guard !model.isHorizontal else { return contentHeight > 0 ? contentHeight : nil }
+        guard !model.isHorizontal else { return model.contentHeight > 0 ? model.contentHeight : nil }
         if let fixed = model.heightLimit { return min(fixed, model.screenLimit) }
-        guard contentHeight > 0 else { return nil }
-        return min(contentHeight, model.screenLimit)
+        guard model.contentHeight > 0 else { return nil }
+        return min(model.contentHeight, model.screenLimit)
     }
 
     var body: some View {
@@ -4885,8 +4894,8 @@ struct WidgetView: View {
         .background {
             GeometryReader { proxy in
                 Color.clear
-                    .onAppear { contentHeight = proxy.size.height }
-                    .onChange(of: proxy.size.height) { _, updated in contentHeight = updated }
+                    .onAppear { model.contentHeight = proxy.size.height }
+                    .onChange(of: proxy.size.height) { _, updated in model.contentHeight = updated }
             }
         }
     }
