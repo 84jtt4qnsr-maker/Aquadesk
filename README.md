@@ -30,7 +30,7 @@ Swift 1 ファイル（AppKit + SwiftUI）で、Xcode プロジェクトなし�
 ## インストール
 
 ```bash
-git clone <このリポジトリの URL>
+git clone https://github.com/84jtt4qnsr-maker/Aquadesk.git
 cd Aquadesk
 zsh install.sh
 ```
