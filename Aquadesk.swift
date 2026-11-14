@@ -726,6 +726,9 @@ enum ClaudeReader {
                 return .failure("API応答の形式が想定と異なります")
             }
             save(reading)
+            if let resets = reading.sevenDayResets {
+                UserDefaults.standard.set(resets.timeIntervalSince1970, forKey: weeklyResetKey)
+            }
             return .success(reading)
         } catch {
             return .failure("ネットワークエラー")
@@ -758,6 +761,20 @@ enum ClaudeReader {
         return formatter.date(from: text)
     }
 
+    /// The last weekly reset time the API reported. The week repeats from it, so the widget can
+    /// tell when an older reading is out of date even while the API can't be reached.
+    private static let weeklyResetKey = "ClaudeWeeklyReset"
+
+    /// The most recent weekly reset at or before `now`, and the one after it.
+    static func weeklySchedule(now: Date, fallback: Date?) -> (last: Date, next: Date)? {
+        let saved = UserDefaults.standard.double(forKey: weeklyResetKey)
+        guard var reset = saved > 0 ? Date(timeIntervalSince1970: saved) : fallback else { return nil }
+        let week: TimeInterval = 7 * 86400
+        let weeks = (now.timeIntervalSince(reset) / week).rounded(.down)
+        reset.addTimeInterval(weeks * week)
+        return (reset, reset.addingTimeInterval(week))
+    }
+
     /// Picks the fresher of the last API reading and the Claude app's local history, per window.
     static func merged(apiNote: String?) -> ProviderUsage {
         let cached = loadCache()
@@ -766,18 +783,25 @@ enum ClaudeReader {
 
         func pick(
             id: String, label: String, apiUsed: Double?, apiResets: Date?,
-            localUsed: Double?, maxAge: TimeInterval
+            localUsed: Double?, maxAge: TimeInterval, schedule: (last: Date, next: Date)? = nil
         ) -> (LimitWindow, Date?) {
             let apiDate = apiUsed == nil ? nil : cached?.fetchedAt
             var localDate = localUsed == nil ? nil : local?.date
             if let date = localDate, now.timeIntervalSince(date) > maxAge { localDate = nil }
 
             if let localDate, apiDate == nil || localDate > apiDate! {
-                return (LimitWindow(id: id, label: label, usedPercent: localUsed, resetsAt: nil), localDate)
+                // A sample from before the latest reset no longer counts: the window has started over.
+                if let schedule, localDate < schedule.last {
+                    return (LimitWindow(id: id, label: label, usedPercent: 0, resetsAt: schedule.next), schedule.last)
+                }
+                return (LimitWindow(id: id, label: label, usedPercent: localUsed, resetsAt: schedule?.next), localDate)
             }
             if let apiDate {
-                let window = LimitWindow(id: id, label: label, usedPercent: apiUsed, resetsAt: apiResets)
-                return (window.normalized(now: now), apiDate)
+                var window = LimitWindow(id: id, label: label, usedPercent: apiUsed, resetsAt: apiResets).normalized(now: now)
+                if window.resetsAt == nil, let schedule {
+                    window = LimitWindow(id: id, label: label, usedPercent: window.usedPercent, resetsAt: schedule.next)
+                }
+                return (window, apiDate)
             }
             return (LimitWindow(id: id, label: label, usedPercent: nil, resetsAt: nil), nil)
         }
@@ -787,7 +811,8 @@ enum ClaudeReader {
             localUsed: local?.fiveHour, maxAge: 5 * 3600)
         let seven = pick(
             id: "seven", label: "週間", apiUsed: cached?.sevenDayUsed, apiResets: cached?.sevenDayResets,
-            localUsed: local?.sevenDay, maxAge: 7 * 86400)
+            localUsed: local?.sevenDay, maxAge: 7 * 86400,
+            schedule: weeklySchedule(now: now, fallback: cached?.sevenDayResets))
 
         return ProviderUsage(
             windows: [five.0, seven.0],
@@ -2181,6 +2206,18 @@ final class WidgetModel: ObservableObject {
     @Published var isEditingLayout = false
     /// The widget's measured content height; kept here rather than in the view's @State (see ShortcutSlot).
     @Published var contentHeight: CGFloat = 0
+    /// Set while the widget fills its display: the window's size there. The layout keeps its
+    /// own size and is scaled up to fit.
+    @Published var maximizedSize: CGSize?
+    /// Each upright panel's measured height, for arranging them in columns when maximized.
+    @Published var panelHeights: [PanelID: CGFloat] = [:]
+    /// The wide band only shows at the widget's own size; filling a display uses columns of the
+    /// upright panels instead, so their order is the one being edited then.
+    var usesWideLayout: Bool { isHorizontal && maximizedSize == nil }
+
+    func reportPanelHeight(_ id: PanelID, _ height: CGFloat) {
+        if abs((panelHeights[id] ?? 0) - height) > 0.5 { panelHeights[id] = height }
+    }
     let panelDrag = PanelDragState()
     private var resizeStart: WidgetLayout?
 
@@ -2191,7 +2228,7 @@ final class WidgetModel: ObservableObject {
     var wideInner: CGFloat { horizontalWidth - 32 }
 
     func movePanel(_ source: PanelID, onto target: PanelID) {
-        layout.move(source, onto: target, horizontal: isHorizontal)
+        layout.move(source, onto: target, horizontal: usesWideLayout)
         layout.save()
     }
 
@@ -2210,7 +2247,7 @@ final class WidgetModel: ObservableObject {
     }
 
     func resetLayout() {
-        layout.reset(horizontal: isHorizontal)
+        layout.reset(horizontal: usesWideLayout)
         layout.save()
     }
 
@@ -3434,6 +3471,7 @@ struct AgendaSection: View {
 }
 
 struct FrameReporter: View {
+    var onAdd: (@MainActor () -> Void)?
     var onRemove: (@MainActor () -> Void)?
     let action: @MainActor (CGRect) -> Void
 
@@ -3441,7 +3479,10 @@ struct FrameReporter: View {
         GeometryReader { proxy in
             let frame = proxy.frame(in: .global)
             Color.clear
-                .onAppear { action(frame) }
+                .onAppear {
+                    onAdd?()
+                    action(frame)
+                }
                 .onChange(of: frame) { _, updated in action(updated) }
                 .onDisappear { onRemove?() }
         }
@@ -4810,14 +4851,70 @@ final class HotKey {
     }
 }
 
+/// Splits the upright panels into side-by-side columns for a widget that fills its display.
+enum ColumnFlow {
+    static let panelWidth: CGFloat = WidgetSize.width - 32
+    static let gap: CGFloat = 32
+    /// Between two panels in a column: the stack's spacing on both sides of a divider.
+    static let between: CGFloat = 27
+    static let padding: CGFloat = 16
+    static let margin: CGFloat = 24
+
+    static func height(_ heights: ArraySlice<CGFloat>) -> CGFloat {
+        heights.reduce(0, +) + between * CGFloat(max(0, heights.count - 1))
+    }
+
+    /// Cuts `heights`, in order, into `count` runs whose tallest is as short as it can be.
+    static func split(_ heights: [CGFloat], into count: Int) -> [Range<Int>] {
+        let n = heights.count
+        var memo: [String: (CGFloat, [Range<Int>])] = [:]
+        func best(from start: Int, _ columns: Int) -> (CGFloat, [Range<Int>]) {
+            if columns == 1 { return (height(heights[start..<n]), [start..<n]) }
+            let key = "\(start)-\(columns)"
+            if let known = memo[key] { return known }
+            var result: (CGFloat, [Range<Int>]) = (.greatestFiniteMagnitude, [])
+            // Leave at least one panel for each later column.
+            for end in (start + 1)...(n - columns + 1) {
+                let rest = best(from: end, columns - 1)
+                let tallest = max(height(heights[start..<end]), rest.0)
+                if tallest < result.0 { result = (tallest, [start..<end] + rest.1) }
+            }
+            memo[key] = result
+            return result
+        }
+        return best(from: 0, count).1
+    }
+
+    /// The column count that lets the panels be drawn largest on a display of `size`.
+    static func best(heights: [CGFloat], in size: CGSize) -> (columns: [Range<Int>], scale: CGFloat) {
+        guard !heights.isEmpty else { return ([], 1) }
+        var choice: (columns: [Range<Int>], scale: CGFloat) = ([0..<heights.count], 0)
+        for count in 1...min(4, heights.count) {
+            let columns = split(heights, into: count)
+            let width = CGFloat(count) * panelWidth + CGFloat(count - 1) * gap + 2 * padding
+            let tallest = columns.map { height(heights[$0]) }.max() ?? 0
+            let scale = min((size.width - 2 * margin) / width, (size.height - 2 * margin) / (tallest + 2 * padding))
+            // A column more has to earn its place by a visibly larger result.
+            if scale > choice.scale * 1.04 { choice = (columns, scale) }
+        }
+        return (choice.columns, max(0.5, min(choice.scale, 3)))
+    }
+}
+
 struct WidgetView: View {
     @ObservedObject var model: WidgetModel
     var solidBackground = false
     var onTargetFrame: @MainActor (ClickTarget, CGRect) -> Void = { _, _ in }
+    /// True when a view showing the target appears, false when it goes. Two views can show the
+    /// same target for a moment while the layout changes, so the window counts them.
+    var onTargetPresence: @MainActor (ClickTarget, Bool) -> Void = { _, _ in }
     var onHeight: @MainActor (CGFloat) -> Void = { _ in }
 
     private func reportFrame(of target: ClickTarget) -> some View {
-        FrameReporter(onRemove: { onTargetFrame(target, .null) }) { onTargetFrame(target, $0) }
+        FrameReporter(
+            onAdd: { onTargetPresence(target, true) },
+            onRemove: { onTargetPresence(target, false) }
+        ) { onTargetFrame(target, $0) }
     }
 
     /// A fixed height when one is set, otherwise the content's; never past the screen's bottom.
@@ -4830,6 +4927,77 @@ struct WidgetView: View {
     }
 
     var body: some View {
+        if let size = model.maximizedSize {
+            maximizedBody(size)
+        } else {
+            normalBody
+        }
+    }
+
+    /// The upright panels in as many columns as fill the display best, scaled up together on one
+    /// tank that covers the screen. Panels keep their order, reading down each column in turn.
+    private func maximizedBody(_ size: CGSize) -> some View {
+        let panels = verticalPanels
+        let plan = ColumnFlow.best(heights: panels.map { model.panelHeights[$0] ?? 140 }, in: size)
+        return HStack(alignment: .top, spacing: ColumnFlow.gap) {
+            ForEach(Array(plan.columns.enumerated()), id: \.offset) { _, range in
+                VStack(alignment: .leading, spacing: 13) {
+                    ForEach(Array(panels[range].enumerated()), id: \.element) { index, id in
+                        if index > 0 { Divider().overlay(Color.white.opacity(0.08)) }
+                        editable(
+                            id, outset: EdgeInsets(top: 5, leading: 8, bottom: 5, trailing: 8),
+                            rows: [.events, .reminders, .network].contains(id) ? model.layout.rowCount(id) : nil
+                        ) {
+                            verticalPanel(id)
+                                .background {
+                                    GeometryReader { proxy in
+                                        Color.clear
+                                            .onAppear { model.reportPanelHeight(id, proxy.size.height) }
+                                            .onChange(of: proxy.size.height) { _, height in model.reportPanelHeight(id, height) }
+                                    }
+                                }
+                        }
+                    }
+                }
+                .frame(width: ColumnFlow.panelWidth, alignment: .topLeading)
+            }
+        }
+        .padding(ColumnFlow.padding)
+        .fixedSize()
+        .scaleEffect(plan.scale)
+        // Click areas are measured on screen, but a change of scale alone doesn't make them
+        // measure again; building the content anew whenever the arrangement changes does.
+        .id("\(plan.columns)-\(Int(plan.scale * 1000))-\(Int(size.width))x\(Int(size.height))")
+        .frame(width: size.width, height: size.height)
+            .foregroundStyle(Color.white.opacity(0.94))
+            .background {
+                AquariumBackground(
+                    level: model.memory.fraction, cpu: model.cpu ?? 0, paused: !model.isWindowVisible,
+                    simulation: model.aquarium, clock: model.aquariumClock)
+            }
+            .background {
+                if solidBackground {
+                    Color(red: 0.11, green: 0.12, blue: 0.14)
+                } else {
+                    VisualEffectBackground()
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+            }
+            // These place things by window coordinates, so they stay outside the scaling.
+            .overlay { SlotDragOverlay(store: model.shortcuts, drag: model.slotDrag) }
+            .overlay {
+                if model.isEditingLayout {
+                    LayoutEditOverlay(drag: model.panelDrag, horizontal: false, onFrame: onTargetFrame)
+                }
+            }
+            .environment(\.colorScheme, .dark)
+    }
+
+    private var normalBody: some View {
         Group {
             // The wide band is short and always shows all of itself, so it never scrolls.
             if model.isHorizontal || (solidBackground && model.heightLimit == nil) {
@@ -5282,11 +5450,13 @@ struct WidgetView: View {
                     .frame(height: 4)
                 }
             }
-            if let note = usage.note, usage.updatedAt == nil {
+            // Shown even beside older figures, so a stalled source doesn't pass for a current one.
+            if let note = usage.note {
                 Text(note)
                     .font(.system(size: 9.5))
                     .foregroundStyle(Palette.warn)
-                    .lineLimit(2)
+                    .lineLimit(usage.updatedAt == nil ? 2 : 1)
+                    .truncationMode(.tail)
             }
         }
     }
@@ -5476,6 +5646,8 @@ final class DesktopWindow: NSWindow {
 
     /// In SwiftUI's global coordinates, whose origin is the top left of the window.
     var targetFrames: [ClickTarget: CGRect] = [:]
+    /// How many views currently show each target; its frame goes only when the last one does.
+    var targetViews: [ClickTarget: Int] = [:]
     var onTargetClick: ((ClickTarget) -> Void)?
     var menuForTarget: ((ClickTarget) -> NSMenu?)?
     /// While locked, dragging doesn't move the widget; clicks still work.
@@ -5492,6 +5664,8 @@ final class DesktopWindow: NSWindow {
     var onResizeWidth: ((CGFloat, Bool) -> Void)?
     /// While the layout is edited, presses go to the panels instead of what they show.
     var isEditingLayout = false
+    /// Filling its display, the widget neither moves nor resizes by dragging; clicks still work.
+    var isMaximized = false
     var panelDrag: PanelDragState?
     var canSwapPanels: ((PanelID, PanelID) -> Bool)?
     var onPanelMove: ((PanelID, PanelID) -> Void)?
@@ -5538,7 +5712,7 @@ final class DesktopWindow: NSWindow {
             break
         }
         guard let source = panel(at: point) else {
-            if !isLocked { performDrag(with: event) }
+            if !isLocked && !isMaximized { performDrag(with: event) }
             return
         }
         var dragging = false
@@ -5622,7 +5796,7 @@ final class DesktopWindow: NSWindow {
             if let view = contentView, let menu = targeted ?? view.menu {
                 NSMenu.popUpContextMenu(menu, with: event, for: view)
             }
-        case .leftMouseDown where !isLocked && resizesWidth && event.locationInWindow.x > frame.width - 8:
+        case .leftMouseDown where !isLocked && !isMaximized && resizesWidth && event.locationInWindow.x > frame.width - 8:
             let startX = NSEvent.mouseLocation.x
             let startWidth = frame.width
             while let next = nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
@@ -5630,7 +5804,7 @@ final class DesktopWindow: NSWindow {
                 onResizeWidth?(startWidth + NSEvent.mouseLocation.x - startX, finished)
                 if finished { break }
             }
-        case .leftMouseDown where !isLocked && !resizesWidth && event.locationInWindow.y < 8:
+        case .leftMouseDown where !isLocked && !isMaximized && !resizesWidth && event.locationInWindow.y < 8:
             let startY = NSEvent.mouseLocation.y
             let startHeight = frame.height
             while let next = nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
@@ -5648,9 +5822,9 @@ final class DesktopWindow: NSWindow {
             if !trackSlotDrag(from: index, startingAt: event.locationInWindow) {
                 onTargetClick?(.slot(index))
             }
-        case .leftMouseDown where isLocked:
+        case .leftMouseDown where isLocked || isMaximized:
             pressedTarget = target(at: event.locationInWindow)
-        case .leftMouseUp where isLocked:
+        case .leftMouseUp where isLocked || isMaximized:
             // A press that ends on the item it started on is a click.
             let pressed = pressedTarget
             pressedTarget = nil
@@ -5716,6 +5890,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let loginItem = NSMenuItem(title: "ログイン時に起動", action: nil, keyEquivalent: "")
     private let lockItem = NSMenuItem(title: "位置を固定", action: nil, keyEquivalent: "")
     private let layoutItem = NSMenuItem(title: "レイアウトを編集", action: nil, keyEquivalent: "")
+    private let maximizeItem = NSMenuItem(title: "画面いっぱいに拡大", action: nil, keyEquivalent: "")
+    private static let maximizedKey = "Maximized"
+    /// Where the widget was before it filled its display, to go back there.
+    private static let restoreFrameKey = "RestoreFrame"
     private let claudeAPIItem = NSMenuItem(title: "Claude使用量をAPIで取得", action: nil, keyEquivalent: "")
     private static let lockedKey = "PositionLocked"
     private static let heightKey = "FixedHeight"
@@ -5751,6 +5929,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = makeMenu()
         let hosting = NSHostingView(rootView: WidgetView(model: model, onTargetFrame: { [weak self] target, frame in
             self?.window?.targetFrames[target] = frame.isNull ? nil : frame
+        }, onTargetPresence: { [weak self] target, present in
+            guard let window = self?.window else { return }
+            let count = (window.targetViews[target] ?? 0) + (present ? 1 : -1)
+            if count > 0 {
+                window.targetViews[target] = count
+            } else {
+                window.targetViews[target] = nil
+                window.targetFrames[target] = nil
+            }
         }, onHeight: { [weak self] height in
             self?.resizeWindow(toHeight: height)
         }))
@@ -5793,7 +5980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.panelDrag = model.panelDrag
         window.canSwapPanels = { [weak self] a, b in
             guard let self else { return false }
-            return self.model.layout.canSwap(a, b, horizontal: self.model.isHorizontal)
+            return self.model.layout.canSwap(a, b, horizontal: self.model.usesWideLayout)
         }
         window.onPanelMove = { [weak self] source, target in
             withAnimation(.easeInOut(duration: 0.2)) { self?.model.movePanel(source, onto: target) }
@@ -5889,9 +6076,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 MainActor.assumeIsolated { self?.updateScreenLimit() }
             },
             NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.updateScreenLimit() }
+                MainActor.assumeIsolated {
+                    self?.updateScreenLimit()
+                    self?.fitToScreen()
+                }
             },
         ]
+        if UserDefaults.standard.bool(forKey: Self.maximizedKey) { setMaximized(true) }
         // A desktop-level widget is often fully covered; the animation needn't run then.
         occlusionObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
@@ -5933,13 +6124,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(Double(window.frame.height), forKey: Self.heightKey)
     }
 
+    @objc private func toggleMaximized() {
+        setMaximized(model.maximizedSize == nil)
+    }
+
+    private func setMaximized(_ maximized: Bool) {
+        guard let window else { return }
+        let defaults = UserDefaults.standard
+        if maximized {
+            // At launch the window already has the maximized frame; the saved one is still right.
+            if model.maximizedSize == nil && !window.isMaximized && !defaults.bool(forKey: Self.maximizedKey) {
+                defaults.set(NSStringFromRect(window.frame), forKey: Self.restoreFrameKey)
+            }
+            window.isMaximized = true
+            defaults.set(true, forKey: Self.maximizedKey)
+            fitToScreen()
+        } else {
+            let screen = window.screen ?? NSScreen.main
+            window.isMaximized = false
+            model.maximizedSize = nil
+            defaults.set(false, forKey: Self.maximizedKey)
+            let width = model.isHorizontal ? min(model.horizontalWidth, maximumWidth) : WidgetSize.width
+            let height = model.isHorizontal ? model.contentHeight : (model.heightLimit ?? model.contentHeight)
+            var frame = defaults.string(forKey: Self.restoreFrameKey).map(NSRectFromString) ?? .zero
+            let area = screen?.visibleFrame ?? .zero
+            if frame == .zero || !area.intersects(frame) {
+                frame = NSRect(x: area.maxX - width - 24, y: area.maxY - 24, width: 0, height: 0)
+            }
+            // Keep the top left corner; the size is whatever the layout needs now.
+            let top = min(frame.maxY, area.maxY)
+            let size = NSSize(width: width, height: max(Self.minimumHeight, min(height, top - area.minY)))
+            let x = min(max(area.minX, frame.minX), area.maxX - size.width)
+            window.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
+            updateScreenLimit()
+        }
+    }
+
+    /// Fills the visible part of the display the widget is on, leaving the menu bar and Dock clear.
+    private func fitToScreen() {
+        guard let window, window.isMaximized, let screen = window.screen ?? NSScreen.main else { return }
+        let frame = screen.visibleFrame.insetBy(dx: 8, dy: 8)
+        window.setFrame(frame, display: true)
+        model.maximizedSize = frame.size
+    }
+
     private var maximumWidth: CGFloat {
         let screen = window?.screen ?? NSScreen.main
         return max(Self.minimumWidth, (screen?.visibleFrame.width ?? 1600) - 16)
     }
 
     private func resizeWindow(toWidth width: CGFloat) {
-        guard let window, window.frame.width != width else { return }
+        guard let window, !window.isMaximized, window.frame.width != width else { return }
         var frame = window.frame
         frame.size.width = width
         window.setFrame(frame, display: true)
@@ -5954,6 +6189,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setOrientation(horizontal: Bool) {
         guard let window, horizontal != model.isHorizontal else { return }
         let defaults = UserDefaults.standard
+        if window.isMaximized {
+            // Still filling the display; only the layout inside changes.
+            model.isHorizontal = horizontal
+            window.resizesWidth = horizontal
+            defaults.set(horizontal, forKey: Self.horizontalKey)
+            return
+        }
         let frame = window.frame
         defaults.set(NSStringFromPoint(NSPoint(x: frame.minX, y: frame.maxY)), forKey: Self.originKey(horizontal: !horizontal))
         var topLeft = defaults.string(forKey: Self.originKey(horizontal: horizontal)).map(NSPointFromString)
@@ -5977,7 +6219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func resizeWindow(toHeight height: CGFloat) {
-        guard let window, height > 0, window.frame.height != height else { return }
+        guard let window, !window.isMaximized, height > 0, window.frame.height != height else { return }
         let frame = window.frame
         window.setFrame(
             NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height), display: true)
@@ -6113,6 +6355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         widthHint.isEnabled = false
         orientations.addItem(widthHint)
         orientationMenu.submenu = orientations
+        maximizeItem.action = #selector(toggleMaximized)
+        maximizeItem.target = self
+        menu.addItem(maximizeItem)
         menu.addItem(orientationMenu)
         menu.addItem(heightMenu)
         layoutItem.action = #selector(toggleEditingLayout)
@@ -6156,8 +6401,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in orientationMenu.submenu?.items ?? [] where item.action != nil {
             item.state = (item.tag == 1) == model.isHorizontal ? .on : .off
         }
-        // The wide layout always fits its content, so a fixed height has nothing to do there.
-        heightMenu.isHidden = model.isHorizontal
         let fixed = model.heightLimit != nil
         heightMenu.submenu?.items.first?.state = fixed ? .off : .on
         heightMenu.submenu?.items.dropFirst().first?.state = fixed ? .on : .off
@@ -6170,6 +6413,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         lockItem.state = window?.isLocked == true ? .on : .off
         layoutItem.state = model.isEditingLayout ? .on : .off
+        maximizeItem.state = model.maximizedSize != nil ? .on : .off
+        // A widget filling its display has no height of its own to set.
+        heightMenu.isHidden = model.isHorizontal || model.maximizedSize != nil
         claudeAPIItem.state = WidgetModel.claudeAPIEnabled ? .on : .off
         guard LoginItem.isInstalled else {
             loginItem.title = "ログイン時に起動（アプリケーションフォルダに入れると使えます）"
@@ -6425,8 +6671,42 @@ func renderSnapshot(to path: String, sampleClaude: String?) {
         ]
     }
     _ = NSApplication.shared
-    let hosting = NSHostingView(rootView: WidgetView(model: model, solidBackground: true))
-    hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
+    // --dump-targets lists the click areas, to check them against what is drawn.
+    var targets: [ClickTarget: CGRect] = [:]
+    let hosting = NSHostingView(rootView: WidgetView(model: model, solidBackground: true, onTargetFrame: { target, frame in
+        targets[target] = frame.isNull ? nil : frame
+    }))
+    defer {
+        if CommandLine.arguments.contains("--dump-targets") {
+            for (target, frame) in targets.sorted(by: { $0.value.minY == $1.value.minY ? $0.value.minX < $1.value.minX : $0.value.minY < $1.value.minY }) {
+                print("target \(target) \(Int(frame.minX)),\(Int(frame.minY)) \(Int(frame.width))x\(Int(frame.height))")
+            }
+        }
+    }
+    // Frame reporters only run inside a window.
+    var probe: NSWindow?
+    if CommandLine.arguments.contains("--dump-targets") {
+        probe = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
+        probe?.contentView = hosting
+        probe?.alphaValue = 0
+        probe?.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        probe?.orderFrontRegardless()
+    }
+    _ = probe
+    if let index = CommandLine.arguments.firstIndex(of: "--sample-maximized"), index + 2 < CommandLine.arguments.count,
+       let width = Double(CommandLine.arguments[index + 1]), let height = Double(CommandLine.arguments[index + 2]) {
+        // Measure the layout first, then scale it into the given screen size.
+        hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        model.maximizedSize = CGSize(width: width, height: height)
+        hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        hosting.layoutSubtreeIfNeeded()
+    } else {
+        hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
+    }
     hosting.layoutSubtreeIfNeeded()
     guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
         print("snapshot failed: no bitmap for \(hosting.bounds.size)")
